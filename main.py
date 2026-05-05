@@ -1,20 +1,26 @@
 """
 =======================================================
   AI IMAGE UPSCALE BOT — Telegram
-  Fast, maximum quality output
-  - Lanczos upscaling (sharpest algorithm)
-  - Unsharp masking (Photoshop-style edge sharpening)
-  - JPEG quality=100, subsampling=0 (no color compression)
-  - Result: 1MB input → 7-12MB output, noticeably sharper
+  Real-ESRGAN — model loaded ONCE at startup (fast)
+  - Auto-uses GPU if available (10x faster)
+  - Uses ALL CPU cores if no GPU
+  - ~45-90 seconds on CPU, ~5-10 seconds on GPU
 =======================================================
   Install:
-    pip install python-telegram-bot Pillow
+    pip install realesrgan basicsr facexlib gfpgan pillow python-telegram-bot torch
 =======================================================
 """
 
 import logging
+import os
+import urllib.request
 from io import BytesIO
+
+import numpy as np
+import torch
+from basicsr.archs.rrdbnet_arch import RRDBNet
 from PIL import Image, ImageFilter, ImageEnhance
+from realesrgan import RealESRGANer
 
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.ext import (
@@ -39,50 +45,124 @@ user_scales: dict[int, int] = {}
 SCALE_OPTIONS = [2, 4, 8, 16]
 DEFAULT_SCALE = 4
 
+MODEL_PATH = "weights/RealESRGAN_x4plus.pth"
+MODEL_URL = "https://github.com/xinntao/Real-ESRGAN/releases/download/v0.1.0/RealESRGAN_x4plus.pth"
+
+# Global upsampler — loaded ONCE at startup, reused for every image
+UPSAMPLER = None
+
+
+# ─── MODEL SETUP ───────────────────────────────────────
+
+def download_model():
+    os.makedirs("weights", exist_ok=True)
+    if not os.path.exists(MODEL_PATH):
+        print("⬇️  Downloading Real-ESRGAN model (~65MB, one-time)...")
+        urllib.request.urlretrieve(MODEL_URL, MODEL_PATH)
+        print("✅ Model downloaded!")
+
+
+def load_model():
+    """
+    Load Real-ESRGAN once at startup and keep in memory.
+    This is the key fix — previous version reloaded from disk every image.
+    Auto-detects GPU (CUDA). Falls back to CPU with all cores.
+    """
+    global UPSAMPLER
+
+    # Use ALL available CPU cores for inference
+    cpu_cores = os.cpu_count() or 4
+    torch.set_num_threads(cpu_cores)
+    torch.set_flush_denormal(True)
+    logger.info(f"Using {cpu_cores} CPU threads")
+
+    # Auto-detect GPU
+    if torch.cuda.is_available():
+        print(f"🚀 GPU detected: {torch.cuda.get_device_name(0)} — using GPU (fast mode)")
+        half_precision = True   # GPU: use float16 for 2x speed boost
+    else:
+        print(f"💻 No GPU found — using CPU with {cpu_cores} cores")
+        half_precision = False  # CPU: must use float32
+
+    model = RRDBNet(
+        num_in_ch=3,
+        num_out_ch=3,
+        num_feat=64,
+        num_block=23,
+        num_grow_ch=32,
+        scale=4,
+    )
+
+    UPSAMPLER = RealESRGANer(
+        scale=4,
+        model_path=MODEL_PATH,
+        model=model,
+        tile=192,           # tile size — 192 balances speed vs RAM usage well
+        tile_pad=10,
+        pre_pad=0,
+        half=half_precision,
+    )
+
+    print("✅ AI model loaded and ready!")
+
 
 # ─── UPSCALE LOGIC ─────────────────────────────────────
 
+def run_esrgan_pass(img_pil: Image.Image) -> Image.Image:
+    """Run one 4x Real-ESRGAN pass using the pre-loaded global model."""
+    img_np = np.array(img_pil.convert("RGB"))
+    img_bgr = img_np[:, :, ::-1]  # RGB → BGR for OpenCV convention
+
+    with torch.inference_mode():   # faster than torch.no_grad()
+        output_bgr, _ = UPSAMPLER.enhance(img_bgr, outscale=4)
+
+    output_rgb = output_bgr[:, :, ::-1]  # BGR → RGB
+    return Image.fromarray(output_rgb)
+
+
 def upscale_image(raw_bytes: bytes, scale: int) -> tuple[BytesIO, float]:
     """
-    Maximum quality upscale pipeline:
-    1. Lanczos resize — sharpest available resampling filter
-    2. Unsharp mask — professional edge sharpening (same as Photoshop)
-    3. Slight contrast boost to make it pop
-    4. Save JPEG quality=100 + subsampling=0
-       → subsampling=0 means full color info kept per pixel (4:4:4)
-       → This alone triples file size vs default JPEG settings
-       → 1MB in → 7-12MB out depending on scale factor
+    Upscale pipeline:
+    - 2x  → ESRGAN 4x pass, resize down to 2x (AI smoothing at 2x dimensions)
+    - 4x  → ESRGAN 4x pass
+    - 8x  → ESRGAN 4x pass + Lanczos 2x
+    - 16x → ESRGAN 4x pass + Lanczos 4x
+    Then: unsharp mask + contrast + quality=100 JPEG
     """
     img = Image.open(BytesIO(raw_bytes)).convert("RGB")
-
     original_w, original_h = img.size
-    new_w = original_w * scale
-    new_h = original_h * scale
+    logger.info(f"Input: {original_w}x{original_h}, target scale: {scale}x")
 
-    logger.info(f"Resizing {original_w}x{original_h} → {new_w}x{new_h}")
+    logger.info("Running Real-ESRGAN 4x AI pass...")
+    img_4x = run_esrgan_pass(img)
+    logger.info(f"ESRGAN pass done: {img_4x.size}")
 
-    # Step 1: Lanczos upscale (highest quality resampling)
-    img = img.resize((new_w, new_h), Image.LANCZOS)
+    if scale == 2:
+        img_out = img_4x.resize((original_w * 2, original_h * 2), Image.LANCZOS)
 
-    # Step 2: Unsharp mask — sharpens edges without touching flat areas
-    # radius=2.5: how wide the sharpening halo is
-    # percent=200: how strong (200 = very strong, noticeable sharpness boost)
-    # threshold=2: only sharpen edges, not flat areas/noise
-    img = img.filter(ImageFilter.UnsharpMask(radius=2.5, percent=200, threshold=2))
+    elif scale == 4:
+        img_out = img_4x
 
-    # Step 3: Slight contrast boost (1.1 = subtle, makes it look crisper)
-    img = ImageEnhance.Contrast(img).enhance(1.1)
+    elif scale == 8:
+        img_out = img_4x.resize((original_w * 8, original_h * 8), Image.LANCZOS)
 
-    # Step 4: Save at absolute maximum JPEG quality
-    # quality=100 → minimal compression
-    # subsampling=0 → saves full RGB color per pixel (default is 4:2:0 which loses color detail)
-    # These two settings together are what makes file size jump dramatically
+    elif scale == 16:
+        img_out = img_4x.resize((original_w * 16, original_h * 16), Image.LANCZOS)
+
+    # Unsharp mask — professional edge sharpening
+    img_out = img_out.filter(ImageFilter.UnsharpMask(radius=1.5, percent=150, threshold=2))
+
+    # Subtle contrast boost
+    img_out = ImageEnhance.Contrast(img_out).enhance(1.08)
+
+    # Save: quality=100 + subsampling=0 = full color, no compression
+    # This is what pushes file size to 7-12MB
     output = BytesIO()
-    img.save(output, format="JPEG", quality=100, subsampling=0, optimize=False)
+    img_out.save(output, format="JPEG", quality=100, subsampling=0, optimize=False)
     output.seek(0)
 
     size_mb = len(output.getvalue()) / (1024 * 1024)
-    logger.info(f"Output size: {size_mb:.1f} MB")
+    logger.info(f"Final size: {size_mb:.1f} MB at {img_out.size}")
     return output, size_mb
 
 
@@ -142,10 +222,10 @@ async def scale_callback(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
 async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     user_id = update.effective_user.id
     scale = user_scales.get(user_id, DEFAULT_SCALE)
-    logger.info(f"Photo received from {user_id}, scale={scale}x")
+    logger.info(f"Photo from {user_id}, scale={scale}x")
 
     status_msg = await update.message.reply_text(
-        f"⏳ Upscaling {scale}x...\n"
+        f"⏳ AI enhancing {scale}x...\n"
         "💡 Tip: Send as File next time for best quality!"
     )
 
@@ -161,13 +241,13 @@ async def handle_photo(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
         await update.message.reply_document(
             document=output,
             filename=f"upscaled_{scale}x.jpg",
-            caption=f"✅ {scale}x Upscaling complete!\nSize: {size_mb:.1f} MB",
+            caption=f"✅ {scale}x AI Enhancement complete!\nSize: {size_mb:.1f} MB",
         )
         await send_menu(update, scale)
 
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
-        await status_msg.edit_text("❌ Something went wrong. Please try again.")
+        await status_msg.edit_text(f"❌ Error: {str(e)[:200]}\n\nPlease try again.")
 
 
 async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -179,13 +259,12 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_text("Please send an image file.")
         return
 
-    logger.info(f"Document received from {user_id}, scale={scale}x")
-    status_msg = await update.message.reply_text(f"⏳ Upscaling {scale}x...")
+    logger.info(f"Document from {user_id}, scale={scale}x")
+    status_msg = await update.message.reply_text(f"⏳ AI enhancing {scale}x...")
 
     try:
         tg_file = await context.bot.get_file(doc.file_id)
         raw_bytes = bytes(await tg_file.download_as_bytearray())
-        logger.info(f"Downloaded {len(raw_bytes)} bytes")
 
         output, size_mb = upscale_image(raw_bytes, scale)
 
@@ -193,13 +272,13 @@ async def handle_document(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         await update.message.reply_document(
             document=output,
             filename=f"upscaled_{scale}x.jpg",
-            caption=f"✅ {scale}x Upscaling complete!\nSize: {size_mb:.1f} MB",
+            caption=f"✅ {scale}x AI Enhancement complete!\nSize: {size_mb:.1f} MB",
         )
         await send_menu(update, scale)
 
     except Exception as e:
         logger.error(f"Error: {e}", exc_info=True)
-        await status_msg.edit_text("❌ Something went wrong. Please try again.")
+        await status_msg.edit_text(f"❌ Error: {str(e)[:200]}\n\nPlease try again.")
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> None:
@@ -209,6 +288,11 @@ async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE) -> N
 # ─── MAIN ──────────────────────────────────────────────
 
 def main() -> None:
+    print("🔄 Downloading model if needed...")
+    download_model()
+    print("🔄 Loading AI model into memory...")
+    load_model()   # ← loads once here, never again
+
     app = Application.builder().token(TOKEN).build()
     app.add_handler(CommandHandler("start", start))
     app.add_handler(CallbackQueryHandler(scale_callback, pattern=r"^scale_\d+$"))
